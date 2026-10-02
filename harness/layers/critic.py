@@ -79,16 +79,70 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept = []
+        split_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            split = self._split_glued(ctx, text)
+            if split is None:
+                continue  # bịa: bỏ claim
+            (left_doc, left_text), (right_doc, right_text) = split
+            kept.append({"text": left_text, "doc_id": left_doc})
+            kept.append({"text": right_text, "doc_id": right_doc})
+            split_any = True
+
+        if split_any:
+            report["abstain"] = True
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu để trả lời câu hỏi này."
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)}
+        )
+        return report
+
+    def _split_glued(self, ctx, text: str):
+        """Tách câu ghép ở liên từ " và "; trả về hai (doc_id, text) nếu
+        cả hai nửa xuất hiện nguyên văn trong bằng chứng và thuộc hai tài
+        liệu khác nhau; ngược lại trả về None."""
+        start = 0
+        while True:
+            pos = text.find(" và ", start)
+            if pos == -1:
+                return None
+            left, right = text[:pos].strip(), text[pos + len(" và ") :].strip()
+            start = pos + 1
+            if not left or not right or not ctx.saw(left) or not ctx.saw(right):
+                continue
+            left_doc = self._line_doc(ctx, left)
+            right_doc = self._line_doc(ctx, right)
+            if left_doc and right_doc and left_doc != right_doc:
+                return (left_doc, left), (right_doc, right)
+
+    @staticmethod
+    def _line_doc(ctx, text: str):
+        if ctx.corpus is None:
+            return None
+        for doc in ctx.corpus.docs:
+            # Containment within one line, not equality: a trimmed
+            # quotation is still a quotation (see citation_checker).
+            if any(text in line for line in doc.body.splitlines()):
+                return doc.doc_id
+        return None
